@@ -49,6 +49,7 @@ if is_torch_available():
     _import_structure["cache_utils"] = ["CacheMixin"]
     _import_structure["controlnets.controlnet"] = ["ControlNetModel"]
     _import_structure["controlnets.controlnet_flux"] = ["FluxControlNetModel", "FluxMultiControlNetModel"]
+    _import_structure["controlnets.controlnet_cosmos"] = ["CosmosControlNetModel"]
     _import_structure["controlnets.controlnet_hunyuan"] = [
         "HunyuanDiT2DControlNetModel",
         "HunyuanDiT2DMultiControlNetModel",

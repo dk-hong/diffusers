@@ -496,6 +496,7 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         fps: Optional[int] = None,
         condition_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        block_controlnet_hidden_states: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
@@ -547,7 +548,7 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             assert False
 
         # 5. Transformer blocks
-        for block in self.transformer_blocks:
+        for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -569,6 +570,8 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     extra_pos_emb=extra_pos_emb,
                     attention_mask=attention_mask,
                 )
+            if block_controlnet_hidden_states is not None and index_block < len(block_controlnet_hidden_states):
+                hidden_states += block_controlnet_hidden_states[index_block]
 
         # 6. Output norm & projection & unpatchify
         hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)

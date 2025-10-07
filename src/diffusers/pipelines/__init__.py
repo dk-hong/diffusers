@@ -164,6 +164,7 @@ else:
     _import_structure["cosmos"] = [
         "Cosmos2TextToImagePipeline",
         "CosmosTextToWorldPipeline",
+        "CosmosTransfer1Pipeline",
         "CosmosVideoToWorldPipeline",
         "Cosmos2VideoToWorldPipeline",
     ]
@@ -592,6 +593,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             Cosmos2TextToImagePipeline,
             Cosmos2VideoToWorldPipeline,
             CosmosTextToWorldPipeline,
+            CosmosTransfer1Pipeline,
             CosmosVideoToWorldPipeline,
         )
         from .deepfloyd_if import (
