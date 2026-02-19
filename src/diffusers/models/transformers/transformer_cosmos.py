@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -496,7 +496,7 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         fps: Optional[int] = None,
         condition_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
-        block_controlnet_hidden_states: Optional[torch.Tensor] = None,
+        block_controlnet_hidden_states: Optional[Union[Tuple[torch.Tensor], Dict[str, torch.Tensor]]] = None,
         return_dict: bool = True,
     ) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
@@ -570,8 +570,13 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     extra_pos_emb=extra_pos_emb,
                     attention_mask=attention_mask,
                 )
-            if block_controlnet_hidden_states is not None and index_block < len(block_controlnet_hidden_states):
-                hidden_states += block_controlnet_hidden_states[index_block]
+            if block_controlnet_hidden_states is not None:
+                if isinstance(block_controlnet_hidden_states, dict):
+                    block_key = f"block{index_block}"
+                    if block_key in block_controlnet_hidden_states:
+                        hidden_states += block_controlnet_hidden_states[block_key]
+                elif index_block < len(block_controlnet_hidden_states):
+                    hidden_states += block_controlnet_hidden_states[index_block]
 
         # 6. Output norm & projection & unpatchify
         hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)

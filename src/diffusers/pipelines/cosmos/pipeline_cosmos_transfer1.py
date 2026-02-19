@@ -137,6 +137,10 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
     implemented for all pipelines (downloading, saving, running on a particular device, etc.).
     """
 
+    model_cpu_offload_seq = "text_encoder->controlnet->transformer->vae"
+    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+    _optional_components = ["safety_checker"]
+
     def __init__(
         self,
         text_encoder: T5EncoderModel,
@@ -162,6 +166,7 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             transformer=transformer,
+            controlnet=controlnet,
             scheduler=scheduler,
             safety_checker=safety_checker,
         )
@@ -381,7 +386,7 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
         latents = latents * self.scheduler.config.sigma_max
 
         if video is not None:
-            latents = video + latents
+            latents = init_latents + latents
 
         padding_shape = (batch_size, 1, num_latent_frames, latent_height, latent_width)
         ones_padding = latents.new_ones(padding_shape)
@@ -424,6 +429,7 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs=None,
         image=None,
         video=None,
+        control_video=None,
     ):
         candidate_inputs = [[704, 960], [704, 1280], [960, 704], [960, 960], [1280, 704]]
         if [height, width] not in candidate_inputs:
@@ -454,6 +460,26 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
         if image is not None and video is not None:
             raise ValueError("Only one of `image` or `video` has to be provided.")
 
+        if control_video is None:
+            raise ValueError("`control_video` must be provided for Cosmos-Transfer1.")
+
+        if isinstance(self.controlnet, CosmosControlNetModel):
+            if isinstance(control_video, (list, tuple)):
+                raise ValueError(
+                    "Single `CosmosControlNetModel` expects a single `control_video`, but got a list/tuple."
+                )
+        elif isinstance(self.controlnet, CosmosMultiControlNetModel):
+            if not isinstance(control_video, (list, tuple)):
+                raise ValueError(
+                    "Multi-ControlNet expects `control_video` as a list/tuple with one control video per controlnet."
+                )
+            if len(control_video) != len(self.controlnet.nets):
+                raise ValueError(
+                    f"Expected {len(self.controlnet.nets)} control videos for Multi-ControlNet, got {len(control_video)}."
+                )
+        else:
+            raise TypeError(f"Unsupported controlnet type: {type(self.controlnet)}")
+
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -481,7 +507,7 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
         video: List[PipelineImageInput] = None,
         prompt: Union[str, List[str]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
-        control_video: List[PipelineImageInput] = None,
+        control_video: Optional[Union[PipelineImageInput, List[PipelineImageInput]]] = None,
         control_weight: Union[float, torch.Tensor, List[float], List[torch.Tensor]] = 1.0,
         height: int = 704,
         width: int = 1280,
@@ -517,7 +543,16 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
         # 1. Check inputs. Raise error if not correct
-        self.check_inputs(prompt, height, width, prompt_embeds, callback_on_step_end_tensor_inputs, image, video)
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            prompt_embeds,
+            callback_on_step_end_tensor_inputs,
+            image,
+            video,
+            control_video,
+        )
 
         self._guidance_scale = guidance_scale
         self._current_timestep = None
@@ -607,7 +642,24 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
                 device=device,
                 dtype=vae_dtype,
             )
-            control_video = self.vae.encode(control_video)
+            control_video = torch.cat(
+                [retrieve_latents(self.vae.encode(video_i.unsqueeze(0))) for video_i in control_video], dim=0
+            )
+            if self.vae.config.latents_mean is not None:
+                latents_mean, latents_std = self.vae.config.latents_mean, self.vae.config.latents_std
+                latents_mean = (
+                    torch.tensor(latents_mean)
+                    .view(1, self.vae.config.latent_channels, -1, 1, 1)[:, :, : control_video.size(2)]
+                    .to(control_video)
+                )
+                latents_std = (
+                    torch.tensor(latents_std)
+                    .view(1, self.vae.config.latent_channels, -1, 1, 1)[:, :, : control_video.size(2)]
+                    .to(control_video)
+                )
+                control_video = (control_video - latents_mean) * self.scheduler.config.sigma_data / latents_std
+            else:
+                control_video = control_video * self.scheduler.config.sigma_data
             control_video = control_video.repeat_interleave(num_videos_per_prompt, dim=0)
         elif isinstance(self.controlnet, CosmosMultiControlNetModel):
             control_videos = []
@@ -620,7 +672,25 @@ class CosmosTransfer1Pipeline(DiffusionPipeline):
                     device=device,
                     dtype=vae_dtype,
                 )
-                control_video_ = self.vae.encode(control_video_)
+                control_video_ = torch.cat(
+                    [retrieve_latents(self.vae.encode(video_i.unsqueeze(0))) for video_i in control_video_], dim=0
+                )
+
+                if self.vae.config.latents_mean is not None:
+                    latents_mean, latents_std = self.vae.config.latents_mean, self.vae.config.latents_std
+                    latents_mean = (
+                        torch.tensor(latents_mean)
+                        .view(1, self.vae.config.latent_channels, -1, 1, 1)[:, :, : control_video_.size(2)]
+                        .to(control_video_)
+                    )
+                    latents_std = (
+                        torch.tensor(latents_std)
+                        .view(1, self.vae.config.latent_channels, -1, 1, 1)[:, :, : control_video_.size(2)]
+                        .to(control_video_)
+                    )
+                    control_video_ = (control_video_ - latents_mean) * self.scheduler.config.sigma_data / latents_std
+                else:
+                    control_video_ = control_video_ * self.scheduler.config.sigma_data
                 control_video_ = control_video_.repeat_interleave(num_videos_per_prompt, dim=0)
 
                 control_videos.append(control_video_)

@@ -25,8 +25,8 @@ else:
     _import_structure["pipeline_cosmos2_text2image"] = ["Cosmos2TextToImagePipeline"]
     _import_structure["pipeline_cosmos2_video2world"] = ["Cosmos2VideoToWorldPipeline"]
     _import_structure["pipeline_cosmos_text2world"] = ["CosmosTextToWorldPipeline"]
-    _import_structure["pipeline_cosmos_transfer1"] = ["CosmosVideoToWorldPipeline"]
-    _import_structure["pipeline_cosmos_video2world"] = ["CosmosTransfer1Pipeline"]
+    _import_structure["pipeline_cosmos_transfer1"] = ["CosmosTransfer1Pipeline"]
+    _import_structure["pipeline_cosmos_video2world"] = ["CosmosVideoToWorldPipeline"]
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     try:

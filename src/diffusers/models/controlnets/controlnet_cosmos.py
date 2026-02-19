@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
@@ -164,7 +165,7 @@ class CosmosControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
     def forward(
         self,
         hint: torch.Tensor,
-        control_weight: torch.Tensor,
+        control_weight: Union[float, torch.Tensor],
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
@@ -176,7 +177,20 @@ class CosmosControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
         # 1. Encode hint
+        if hint.size(1) < self.config.hint_channels:
+            padding_channels = self.config.hint_channels - hint.size(1)
+            hint_padding = hint.new_zeros(batch_size, padding_channels, num_frames, height, width)
+            hint = torch.cat([hint, hint_padding], dim=1)
+        elif hint.size(1) > self.config.hint_channels:
+            raise ValueError(
+                f"Expected hint channels <= {self.config.hint_channels}, but got {hint.size(1)}. "
+                "Please check control input channels."
+            )
+
+        hint_states = hint
         if self.config.concat_padding_mask:
+            if padding_mask is None:
+                raise ValueError("`padding_mask` must be provided when `concat_padding_mask=True`.")
             padding_mask = transforms.functional.resize(
                 padding_mask, list(hint.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
             )
@@ -193,16 +207,45 @@ class CosmosControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         if attention_mask is not None:
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
 
-        # 2. Generate positional embeddings
-        hidden_states = self.patch_embed(hidden_states)
+        # 2. Generate positional embeddings from pre-patch layout
         image_rotary_emb = self.rope(hidden_states, fps=fps)
         extra_pos_emb = self.learnable_pos_embed(hidden_states) if self.config.extra_pos_embed_type else None
+        hidden_states = self.patch_embed(hidden_states)
 
-        # 3. Patchify input
+        # 3. Flatten patchified inputs to sequence
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        hidden_states = hidden_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, THW, C]
+        hint_states = hint_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, THW, C]
+
+        if isinstance(control_weight, torch.Tensor) and control_weight.ndim >= 2:
+            if control_weight.ndim == 4:
+                control_weight = control_weight.unsqueeze(1)
+            if control_weight.ndim != 5:
+                raise ValueError(
+                    f"Expected control weight tensor to have shape [B, 1, T, H, W] (or [B, T, H, W]), got {tuple(control_weight.shape)}"
+                )
+            if control_weight.shape[-2:] != (height, width):
+                raise ValueError(
+                    f"Expected spatial control weight map shape (*, *, *, {height}, {width}), got {tuple(control_weight.shape)}"
+                )
+            control_weight = control_weight.permute(0, 2, 1, 3, 4).reshape(-1, control_weight.shape[1], height, width)
+            control_weight = F.interpolate(
+                control_weight,
+                size=(post_patch_height, post_patch_width),
+                mode="nearest",
+            )
+            control_weight = control_weight.reshape(batch_size, num_frames, -1, post_patch_height, post_patch_width)
+            control_weight = control_weight.permute(0, 2, 1, 3, 4)
+            if control_weight.shape[-3] != num_frames:
+                raise ValueError(
+                    f"Expected temporal control weight map length {num_frames}, got {control_weight.shape[-3]}"
+                )
+            if p_t > 1:
+                control_weight = control_weight.unflatten(-3, (post_patch_num_frames, p_t)).mean(dim=-3)
+            control_weight = control_weight.flatten(-3, -1).transpose(1, 2).type_as(hidden_states)
 
         # 4. Timestep embeddings
         if timestep.ndim == 1:
@@ -250,7 +293,8 @@ class CosmosControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             if hint_states is not None:
                 hidden_states += hint_states
                 hint_states = None
-            hint_val = controlnet_block(hidden_states) * control_weight
+            control_feat = controlnet_block(hidden_states)
+            hint_val = control_feat * control_weight
             controlnet_block_res_samples = controlnet_block_res_samples + (hint_val,)
 
         if not return_dict:
@@ -277,8 +321,8 @@ class CosmosMultiControlNetModel(ModelMixin):
 
     def forward(
         self,
-        hint: torch.Tensor,
-        control_weight: torch.Tensor,
+        hint: Union[torch.Tensor, List[torch.Tensor]],
+        control_weight: Union[float, torch.Tensor, List[float], List[torch.Tensor]],
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
@@ -287,6 +331,21 @@ class CosmosMultiControlNetModel(ModelMixin):
         padding_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> torch.Tensor:
+        if not isinstance(hint, (list, tuple)):
+            raise ValueError("For `CosmosMultiControlNetModel`, `hint` must be provided as a list or tuple.")
+
+        if isinstance(control_weight, (float, int)):
+            control_weight = [float(control_weight)] * len(self.nets)
+        elif isinstance(control_weight, torch.Tensor) and control_weight.ndim == 0:
+            control_weight = [float(control_weight)] * len(self.nets)
+        elif isinstance(control_weight, torch.Tensor) and control_weight.ndim == 1:
+            control_weight = [float(w) for w in control_weight]
+
+        if len(hint) != len(self.nets):
+            raise ValueError(f"Expected {len(self.nets)} hints, got {len(hint)}.")
+        if not isinstance(control_weight, (list, tuple)) or len(control_weight) != len(self.nets):
+            raise ValueError(f"Expected {len(self.nets)} control weights, got {len(control_weight)}.")
+
         for i, (target_hint, scale, controlnet) in enumerate(zip(hint, control_weight, self.nets)):
             block_samples = controlnet(
                 hint=target_hint,
